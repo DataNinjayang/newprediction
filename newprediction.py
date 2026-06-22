@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 import os
 import time
 import io
-import re
 import baostock as bs
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -18,6 +17,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import Image
 import plotly.io as pio
 
 # ======================== 页面配置 ========================
@@ -40,7 +40,7 @@ DATA_DIR = "./data"
 STOCK_FILE = os.path.join(DATA_DIR, "stock_data.csv")
 START_DATE = "2015-01-01"
 
-# ======================== 数据获取函数 ========================
+# ======================== 核心数据获取函数（整合自 get_stock_data.py） ========================
 def login_baostock():
     lg = bs.login()
     if lg.error_code != '0':
@@ -49,6 +49,18 @@ def login_baostock():
 
 def logout_baostock():
     bs.logout()
+
+def get_hs300_stocks():
+    """获取沪深300成分股列表"""
+    rs = bs.query_hs300_stocks()
+    if rs.error_code != '0':
+        raise Exception(f"获取成分股失败: {rs.error_msg}")
+    stocks = []
+    while (rs.error_code == '0') & rs.next():
+        stocks.append(rs.get_row_data())
+    df = pd.DataFrame(stocks, columns=rs.fields)
+    df['纯代码'] = df['code'].str.replace('sh.', '').str.replace('sz.', '').str.zfill(6)
+    return df
 
 def fetch_stock_history(bs_code, start, end):
     """获取单只股票历史数据（含估值指标）"""
@@ -70,31 +82,46 @@ def fetch_stock_history(bs_code, start, end):
     df['振幅'] = ((df['high'] - df['low']) / df['preclose'] * 100).round(2)
     df['涨跌额'] = (df['close'] - df['preclose']).round(2)
     df['日期'] = pd.to_datetime(df['date']).dt.strftime('%Y/%m/%d')
-    df = df[['日期','open','high','low','close','volume','amount','turn','pctChg','peTTM','pbMRQ','psTTM','pcfNcfTTM','振幅','涨跌额']]
-    df.columns = ['日期','开盘','最高','最低','收盘','成交量','成交额','换手率','涨跌幅','peTTM','pbMRQ','psTTM','pcfNcfTTM','振幅','涨跌额']
+    # 提取纯数字代码
+    df['股票代码'] = df['code'].str.replace('sh.', '').str.replace('sz.', '').str.zfill(6)
+    df = df[['日期','股票代码','open','high','low','close','volume','amount','turn','pctChg','peTTM','pbMRQ','psTTM','pcfNcfTTM','振幅','涨跌额']]
+    df.columns = ['日期','股票代码','开盘','最高','最低','收盘','成交量','成交额','换手率','涨跌幅','peTTM','pbMRQ','psTTM','pcfNcfTTM','振幅','涨跌额']
     return df
+
+def merge_stock_data(existing_df, new_df, stock_code):
+    """合并现有数据和新数据（同一股票去重排序）"""
+    if new_df is None or new_df.empty:
+        return existing_df
+    # 分离该股票和其他股票
+    other = existing_df[existing_df['股票代码'] != stock_code] if not existing_df.empty else pd.DataFrame()
+    stock_existing = existing_df[existing_df['股票代码'] == stock_code] if not existing_df.empty else pd.DataFrame()
+    if not stock_existing.empty:
+        combined = pd.concat([stock_existing, new_df], ignore_index=True)
+        combined['日期_dt'] = pd.to_datetime(combined['日期'], format='%Y/%m/%d')
+        combined = combined.drop_duplicates(subset=['日期_dt']).sort_values('日期_dt')
+        combined = combined.drop(columns=['日期_dt'])
+    else:
+        combined = new_df
+    result = pd.concat([other, combined], ignore_index=True)
+    return result
 
 def get_all_data(progress_callback=None):
     """获取全部沪深300成分股数据（增量更新）"""
     os.makedirs(DATA_DIR, exist_ok=True)
     login_baostock()
     try:
-        # 获取成分股列表
-        rs = bs.query_hs300_stocks()
-        stocks = []
-        while (rs.error_code == '0') & rs.next():
-            stocks.append(rs.get_row_data())
-        hs300_df = pd.DataFrame(stocks, columns=rs.fields)
-        hs300_df['纯代码'] = hs300_df['code'].str.replace('sh.', '').str.replace('sz.', '').str.zfill(6)
-        code_name = dict(zip(hs300_df['纯代码'], hs300_df['code_name']))
+        hs300_df = get_hs300_stocks()
         total = len(hs300_df)
-
         # 加载已有数据
         existing_df = pd.DataFrame()
         if os.path.exists(STOCK_FILE):
-            existing_df = pd.read_csv(STOCK_FILE, encoding='utf-8-sig')
-            existing_df['日期'] = pd.to_datetime(existing_df['日期'])
-            existing_df['股票代码'] = existing_df['股票代码'].astype(str).str.zfill(6)
+            try:
+                existing_df = pd.read_csv(STOCK_FILE, encoding='utf-8-sig')
+                existing_df['日期'] = pd.to_datetime(existing_df['日期'])
+                existing_df['股票代码'] = existing_df['股票代码'].astype(str).str.zfill(6)
+            except Exception as e:
+                st.warning(f"读取旧数据失败，将重新获取: {e}")
+                existing_df = pd.DataFrame()
 
         today = datetime.now().date()
         for idx, row in hs300_df.iterrows():
@@ -110,35 +137,26 @@ def get_all_data(progress_callback=None):
                 existing_dates = existing_stock['日期'].dt.date
                 min_date = existing_dates.min()
                 max_date = existing_dates.max()
+                # 数据完整则跳过
                 if min_date <= datetime.strptime(START_DATE, '%Y-%m-%d').date() and max_date >= today - timedelta(days=1):
-                    continue  # 数据完整
-                # 补缺
-                if min_date > datetime.strptime(START_DATE, '%Y-%m-%d').date():
-                    fetch_start = START_DATE
-                else:
-                    fetch_start = (max_date + timedelta(days=1)).strftime('%Y-%m-%d')
-                if max_date < today:
-                    fetch_end = today.strftime('%Y-%m-%d')
-                else:
+                    continue
+                # 确定补缺区间
+                fetch_start = START_DATE if min_date > datetime.strptime(START_DATE, '%Y-%m-%d').date() else (max_date + timedelta(days=1)).strftime('%Y-%m-%d')
+                fetch_end = today.strftime('%Y-%m-%d') if max_date < today else None
+                if fetch_end is None:
                     continue
             else:
                 fetch_start = START_DATE
                 fetch_end = today.strftime('%Y-%m-%d')
 
+            # 获取新数据
             new_data = fetch_stock_history(bs_code, fetch_start, fetch_end)
             if new_data is not None and not new_data.empty:
-                new_data['股票代码'] = code
-                new_data['股票名称'] = name
-                if not existing_stock.empty:
-                    combined = pd.concat([existing_stock, new_data], ignore_index=True)
-                    combined = combined.drop_duplicates(subset=['日期']).sort_values('日期')
-                    existing_df = existing_df[existing_df['股票代码'] != code]
-                    existing_df = pd.concat([existing_df, combined], ignore_index=True)
-                else:
-                    existing_df = pd.concat([existing_df, new_data], ignore_index=True)
-                # 每只股票保存一次（防中断丢失）
+                # 合并
+                existing_df = merge_stock_data(existing_df, new_data, code)
+                # 立即写回（防中断）
                 existing_df.to_csv(STOCK_FILE, index=False, encoding='utf-8-sig')
-            time.sleep(0.3)  # 避免请求过频
+            time.sleep(0.3)  # 限流
 
         existing_df.to_csv(STOCK_FILE, index=False, encoding='utf-8-sig')
         return True
@@ -147,10 +165,14 @@ def get_all_data(progress_callback=None):
 
 def load_local_data():
     if os.path.exists(STOCK_FILE):
-        df = pd.read_csv(STOCK_FILE, encoding='utf-8-sig')
-        df['日期'] = pd.to_datetime(df['日期'])
-        df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
-        return df
+        try:
+            df = pd.read_csv(STOCK_FILE, encoding='utf-8-sig')
+            df['日期'] = pd.to_datetime(df['日期'])
+            df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
+            return df
+        except Exception as e:
+            st.error(f"加载数据失败: {e}")
+            return None
     return None
 
 # ======================== 估值模型 ========================
@@ -177,7 +199,6 @@ def calculate_valuation(stock_df):
 
     # 绝对估值（简化DCF：戈登增长模型）
     eps = price / pe_ratio if pe_ratio > 0 else 1
-    # 增长率取过去3年价格复合增长
     if len(stock_df) >= 756:
         price_3y = stock_df.iloc[-756]['收盘']
         growth = (price / price_3y) ** (1/3) - 1
@@ -233,18 +254,25 @@ def calculate_valuation(stock_df):
         'growth': growth
     }
 
-# ======================== PDF生成 ========================
+# ======================== PDF生成（中文字体自适应） ========================
 def register_chinese_font():
-    font_name = "SimSun"
+    """注册系统中可用的中文字体，若无则使用默认字体"""
+    font_name = "Helvetica"  # 备用
     try:
-        font_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "simsun.ttc")
-        pdfmetrics.registerFont(TTFont(font_name, font_path, subfontIndex=0))
+        # 尝试常见中文字体路径
+        possible_fonts = [
+            ("SimSun", r"C:\Windows\Fonts\simsun.ttc"),
+            ("SimHei", r"C:\Windows\Fonts\simhei.ttf"),
+            ("Microsoft YaHei", r"C:\Windows\Fonts\msyh.ttc"),
+            ("PingFang SC", "/System/Library/Fonts/PingFang.ttc"),  # macOS
+            ("NotoSansCJK", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),  # Linux
+        ]
+        for name, path in possible_fonts:
+            if os.path.exists(path):
+                pdfmetrics.registerFont(TTFont(name, path))
+                return name
     except:
-        try:
-            font_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "simhei.ttf")
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
-        except:
-            pass
+        pass
     return font_name
 
 CHINESE_FONT = register_chinese_font()
@@ -290,19 +318,19 @@ def create_pdf_report(code, name, stock_df, val_result):
     # 插入K线图（转为图片）
     try:
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-        stock_df['MA5'] = stock_df['收盘'].rolling(5).mean()
-        stock_df['MA10'] = stock_df['收盘'].rolling(10).mean()
-        stock_df['MA20'] = stock_df['收盘'].rolling(20).mean()
-        fig.add_trace(go.Candlestick(x=stock_df['日期'], open=stock_df['开盘'], high=stock_df['最高'], low=stock_df['最低'], close=stock_df['收盘']), row=1, col=1)
-        fig.add_trace(go.Scatter(x=stock_df['日期'], y=stock_df['MA5'], name='MA5'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=stock_df['日期'], y=stock_df['MA10'], name='MA10'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=stock_df['日期'], y=stock_df['MA20'], name='MA20'), row=1, col=1)
-        vol_colors = ['red' if o <= c else 'green' for o, c in zip(stock_df['开盘'], stock_df['收盘'])]
-        fig.add_trace(go.Bar(x=stock_df['日期'], y=stock_df['成交量'], marker_color=vol_colors), row=2, col=1)
+        df_plot = stock_df.copy()
+        df_plot['MA5'] = df_plot['收盘'].rolling(5).mean()
+        df_plot['MA10'] = df_plot['收盘'].rolling(10).mean()
+        df_plot['MA20'] = df_plot['收盘'].rolling(20).mean()
+        fig.add_trace(go.Candlestick(x=df_plot['日期'], open=df_plot['开盘'], high=df_plot['最高'], low=df_plot['最低'], close=df_plot['收盘']), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_plot['日期'], y=df_plot['MA5'], name='MA5'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_plot['日期'], y=df_plot['MA10'], name='MA10'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_plot['日期'], y=df_plot['MA20'], name='MA20'), row=1, col=1)
+        vol_colors = ['red' if o <= c else 'green' for o, c in zip(df_plot['开盘'], df_plot['收盘'])]
+        fig.add_trace(go.Bar(x=df_plot['日期'], y=df_plot['成交量'], marker_color=vol_colors), row=2, col=1)
         fig.update_layout(height=400, template='plotly_white', xaxis_rangeslider_visible=False)
         img_bytes = pio.to_image(fig, format='png', width=600, height=400)
         img_buffer = io.BytesIO(img_bytes)
-        from reportlab.platypus import Image
         img = Image(img_buffer, width=450, height=300)
         story.append(Spacer(1, 15))
         story.append(Paragraph("K线图", head_style))
@@ -324,13 +352,17 @@ def main():
             progress_bar = st.progress(0, text="准备...")
             def update_progress(current, total, msg):
                 progress_bar.progress(current/total, text=f"{current}/{total} {msg}")
-            success = get_all_data(update_progress)
-            if success:
-                status.update(label="数据获取完成！", state="complete")
-                st.success("数据已更新！")
-                st.rerun()
-            else:
-                status.update(label="获取失败", state="error")
+            try:
+                success = get_all_data(update_progress)
+                if success:
+                    status.update(label="数据获取完成！", state="complete")
+                    st.success("数据已更新！")
+                    st.rerun()
+                else:
+                    status.update(label="获取失败", state="error")
+            except Exception as e:
+                status.update(label=f"错误: {str(e)}", state="error")
+                st.error(f"获取数据时发生异常: {e}")
 
     # 加载数据
     df = load_local_data()
@@ -407,13 +439,16 @@ def main():
     # 导出PDF
     st.divider()
     if st.button("📄 导出PDF分析报告"):
-        pdf_bytes = create_pdf_report(selected, stock_names.get(selected, ''), stock_df, val)
-        st.download_button(
-            label="⬇️ 下载报告",
-            data=pdf_bytes,
-            file_name=f"{selected}_估值报告_{datetime.now().strftime('%Y%m%d')}.pdf",
-            mime="application/pdf"
-        )
+        try:
+            pdf_bytes = create_pdf_report(selected, stock_names.get(selected, ''), stock_df, val)
+            st.download_button(
+                label="⬇️ 下载报告",
+                data=pdf_bytes,
+                file_name=f"{selected}_估值报告_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.error(f"PDF生成失败: {e}")
 
 if __name__ == "__main__":
     main()
